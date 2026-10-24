@@ -10,6 +10,8 @@ services:
       mountPath: /data
       sizeGB: 1
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
       - key: MODE
         value: paper
       - key: DATA_DIR
