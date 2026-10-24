@@ -1,0 +1,22 @@
+services:
+  - type: worker
+    name: kronos4h-paper-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    disk:
+      name: kronos4h-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: MODE
+        value: paper
+      - key: DATA_DIR
+        value: /data
+      - key: PAIRS
+        value: ETH,SOL,ZEC,IRYS,XRP,NEAR,XMR,USELESS,ASTER,LINK,ADA,DOGE
+      - key: POSITION_FRAC
+        value: "0.10"
+      - key: START_CASH
+        value: "1000"
