@@ -49,6 +49,7 @@ STATE_PATH = os.path.join(DATA_DIR, os.getenv("STATE_FILE", "kronos4h_state.json
 TRADES_CSV = os.path.join(DATA_DIR, "kronos4h_trades.csv")
 SIGNALS_CSV = os.path.join(DATA_DIR, "kronos4h_signals.csv")
 EQUITY_CSV = os.path.join(DATA_DIR, "kronos4h_equity.csv")
+EXPOSURE_CSV = os.path.join(DATA_DIR, "kronos4h_exposure.csv")
 H = 3600
 
 
@@ -62,6 +63,14 @@ def contract(p):
 
 def append_csv(path, header, row):
     new = not os.path.exists(path)
+    if not new:
+        with open(path) as f:
+            if f.readline().strip() != ",".join(header):
+                old = path.replace(".csv", ".old.csv")
+                os.replace(path, old)
+                log(f"{os.path.basename(path)}: column layout changed, kept the old file as "
+                    f"{os.path.basename(old)} and started a new one")
+                new = True
     with open(path, "a", newline="") as f:
         w = csv.writer(f)
         if new:
@@ -90,7 +99,13 @@ def acct_equity(a, prices):
     return a["cash"] + sum(p["dir"] * p["qty"] * (prices.get(s, p["entry"]) - p["entry"]) for s, p in a["pos"].items())
 
 
-def close_pos(st, name, sym, px, why, now_iso):
+def acct_exposure(a, prices):
+    """Signed notional (long minus short) and gross notional. A market-neutral book has net 0."""
+    vals = [p["dir"] * p["qty"] * prices.get(s, p["entry"]) for s, p in a["pos"].items()]
+    return sum(vals), sum(abs(v) for v in vals)
+
+
+def close_pos(st, name, sym, px, why, now_iso, bench_ret=0.0):
     a = st["accounts"][name]
     p = a["pos"].pop(sym)
     fill = px * (1 - p["dir"] * SLIPPAGE)
@@ -100,10 +115,18 @@ def close_pos(st, name, sym, px, why, now_iso):
     a["fees"] += fee
     a["trades"] += 1
     ret = p["dir"] * (fill / p["entry"] - 1) - p["fee_in"] / (p["qty"] * p["entry"]) - TAKER_FEE
+    # excess = the trade after removing the equal-weight move of the same universe over the same window.
+    # This is the only number that says anything about the model: `ret` is mostly market direction,
+    # because the book is not dollar-neutral and can be 40% net long or 10% net short.
+    excess = ret - p["dir"] * bench_ret
+    a["excess"] = a.get("excess", 0.0) + excess
+    a["excess_sq"] = a.get("excess_sq", 0.0) + excess * excess
     a["wins"] += ret > 0
-    append_csv(TRADES_CSV, ["closed", "account", "symbol", "side", "entry", "exit", "return_after_fees", "reason", "score"],
-               [now_iso, name, sym, "LONG" if p["dir"] == 1 else "SHORT", p["entry"], round(fill, 10), round(ret, 5), why, round(p["score"], 4)])
-    return ret
+    append_csv(TRADES_CSV, ["closed", "account", "symbol", "side", "entry", "exit", "return_after_fees",
+                            "excess_after_fees", "reason", "score"],
+               [now_iso, name, sym, "LONG" if p["dir"] == 1 else "SHORT", p["entry"], round(fill, 10),
+                round(ret, 5), round(excess, 5), why, round(p["score"], 4)])
+    return ret, excess
 
 
 def cycle(st, scorer, now=None, fetch=None, summarize=None):
@@ -124,6 +147,20 @@ def cycle(st, scorer, now=None, fetch=None, summarize=None):
             prices[s] = float(frames[s].close.iloc[-1])
         except Exception as e:
             log(f"{s}: data error, skipped this cycle ({e})")
+
+    # 0) benchmark: equal-weight index of the traded universe, sampled at every decision hour.
+    #    Needed to separate "the coin went up" from "the coin beat the other coins".
+    if decide:
+        prev = st.get("bench_px") or {}
+        rets = [prices[s] / prev[s] - 1.0 for s in syms if s in prev and s in prices and prev[s] > 0]
+        if rets:
+            st["bench_level"] = st.get("bench_level", 1.0) * (1.0 + float(np.mean(rets)))
+        st["bench_px"] = {s: prices[s] for s in syms if s in prices}
+        hist = st.setdefault("bench_hist", {})
+        hist[str(close_hour)] = st.get("bench_level", 1.0)
+        if len(hist) > 1000:                       # keep the state file from growing forever
+            for k in sorted(hist, key=int)[:-1000]:
+                del hist[k]
 
     # 1) pending limit entries: filled if the candle after the signal traded through the limit price
     for s, o in list(st["pending"].items()):
@@ -148,14 +185,18 @@ def cycle(st, scorer, now=None, fetch=None, summarize=None):
             log(f"{s}: limit {'buy' if o['dir'] == 1 else 'sell'} at {o['limit']:.6g} not filled - missed")
 
     # 2) exits after HOLD_H hours (market order at that candle's close)
+    hist = st.get("bench_hist", {})
     for name in ("limit", "market"):
         for s, p in list(st["accounts"][name]["pos"].items()):
             if close_hour >= p["exit_at"] and s in prices:
                 df = frames[s]
                 row = df[df.t_ms // 1000 + H == p["exit_at"]]
                 px = float(row.close.iloc[0]) if len(row) else prices[s]
-                r = close_pos(st, name, s, px, f"{HOLD_H}h exit", now_iso)
-                log(f"[{name}] {s}: closed {'LONG' if p['dir'] == 1 else 'SHORT'} after {HOLD_H}h: {r:+.2%} after fees")
+                base, lvl = hist.get(str(p["exit_at"] - HOLD_H * H)), hist.get(str(close_hour))
+                bench_ret = (lvl / base - 1.0) if (base and lvl) else 0.0
+                r, ex = close_pos(st, name, s, px, f"{HOLD_H}h exit", now_iso, bench_ret)
+                log(f"[{name}] {s}: closed {'LONG' if p['dir'] == 1 else 'SHORT'} after {HOLD_H}h: "
+                    f"{r:+.2%} after fees (excess {ex:+.2%} vs basket)")
 
     # 3) new signals
     if decide:
@@ -197,9 +238,14 @@ def cycle(st, scorer, now=None, fetch=None, summarize=None):
         a = st["accounts"][name]
         eq = acct_equity(a, prices)
         wr = a["wins"] / a["trades"] if a["trades"] else float("nan")
-        log(f"[{name}] equity {eq:.2f} ({eq / START_CASH - 1:+.2%}) | trades {a['trades']} | win rate {wr:.0%} | open {len(a['pos'])} | fees {a['fees']:.2f}")
+        net, gross_exp = acct_exposure(a, prices)
+        net_pct = net / eq if eq else 0.0
+        log(f"[{name}] equity {eq:.2f} ({eq / START_CASH - 1:+.2%}) | trades {a['trades']} | win rate {wr:.0%} "
+            f"| open {len(a['pos'])} | net {net_pct:+.0%} of equity | fees {a['fees']:.2f}")
         append_csv(EQUITY_CSV, ["time", "account", "equity", "trades", "wins", "open", "fees"],
                    [now_iso, name, round(eq, 4), a["trades"], a["wins"], len(a["pos"]), round(a["fees"], 4)])
+        append_csv(EXPOSURE_CSV, ["time", "account", "equity", "net", "gross", "open"],
+                   [now_iso, name, round(eq, 4), round(net, 2), round(gross_exp, 2), len(a["pos"])])
     save_state(st)
 
 
@@ -209,9 +255,32 @@ def report():
         return
     st = load_state()
     for name, a in st["accounts"].items():
-        wr = a["wins"] / a["trades"] if a["trades"] else float("nan")
-        print(f"{name:6s}: cash {a['cash']:.2f} ({a['cash'] / START_CASH - 1:+.2%} closed P&L) | trades {a['trades']} | win rate {wr:.0%} | fees {a['fees']:.2f}")
+        n = a["trades"]
+        wr = a["wins"] / n if n else float("nan")
+        print(f"{name:6s}: cash {a['cash']:.2f} ({a['cash'] / START_CASH - 1:+.2%} closed P&L) | trades {n} | "
+              f"win rate {wr:.0%} | fees {a['fees']:.2f}")
+        if not n:
+            print("       excess vs equal-weight basket: no closed trades yet")
+            continue
+        ex, ex2 = a.get("excess", 0.0), a.get("excess_sq", 0.0)
+        mean_ex = ex / n
+        var = max(ex2 / n - mean_ex ** 2, 0.0)
+        se = (var / n) ** 0.5
+        t = mean_ex / se if se > 1e-12 else float("nan")
+        t_txt = f"{t:+.2f}" if np.isfinite(t) else "n/a"
+        print(f"       excess vs equal-weight basket: total {ex:+.2%} | per trade {mean_ex:+.3%} | "
+              f"t {t_txt} (n={n})")
+        if n >= 600:
+            verdict = "has skill" if mean_ex > 0 and t > 2 else "NO cross-sectional skill - kill it"
+            print(f"       verdict at n>={600}: {verdict}")
+        else:
+            print(f"       {600 - n} more closed trades before this means anything")
     print(f"signals {st['signals']} | limit entries missed {st['missed']}")
+    print()
+    print("excess = the trade's return after removing the equal-weight move of the same coins over the")
+    print("same window. Total P&L is mostly market direction because the book is not dollar-neutral;")
+    print("excess is the only number that says whether the model picks coins better than chance.")
+    print("Kill criterion: at ~600 trades, mean excess per trade below zero (or t below 2) = no edge.")
 
 
 def main():

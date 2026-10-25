@@ -23,6 +23,34 @@ Two paper accounts run on the same signals, so you can see what the order type c
 - `kronos4h_model.json` is the trained model (on all 150 days). The bot's Kronos summaries were checked
   to be identical to the research ones (difference 0.0).
 
+## Reading the results
+
+Two numbers matter, and the equity curve is not one of them.
+
+**Net exposure.** The book is not dollar-neutral: it can be 40% net long or 10% net short depending on
+which way the scores point. `kronos4h_exposure.csv` records net and gross notional every hour, and the
+log line shows net as a percentage of equity. A book that is quietly net long in a rising market will
+look skilful when it is only exposed.
+
+**Excess vs the basket.** Every closed trade records `excess_after_fees` in `kronos4h_trades.csv`: the
+trade's return after removing the equal-weight move of the same coins over the same window
+(`ret - basket` for a long, `ret + basket` for a short). This is the only number that says whether the
+model picks coins better than chance.
+
+`python bot.py --report` prints the running excess, its t-statistic, and how many trades are still
+needed before the result means anything.
+
+**Kill criterion, fixed in advance:** at ~600 closed trades, if mean excess per trade is below zero
+(or t is below 2), the model has no cross-sectional skill and the bot is dead - regardless of how the
+equity curve looks. At ~8 trades a day that is about three months.
+
+**Caveat on the backtest above:** `kronos4h_model.json` was trained on 2026-05-27..2026-10-23, which
+is the same window the "locked newest 30 days" result covers. That number is therefore in-sample, and
+the paper run is the first genuinely out-of-sample test.
+
+`python test_excess.py` checks the accounting on synthetic data with no network: a book of coins that
+all move together must show zero excess, and a single coin that moves alone must show almost all of it.
+
 ## Render
 Background worker. It runs Kronos-mini like KB does, so the Starter plan (512 MB) should fit; keep
 `TORCH_THREADS=1`. Add a disk at `/data` and set `DATA_DIR=/data`. `render.yaml` has a blueprint.
