@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+kronos4h_state.json
+kronos4h_equity.csv
+kronos4h_trades.csv
+kronos4h_signals.csv
+kronos4h_exposure.csv
+STOP
