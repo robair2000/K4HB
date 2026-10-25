@@ -56,7 +56,7 @@ def make_fetch(px):
     return fetch
 
 
-def run(growth, score_sym, label):
+def run(growth, score_sym, label, break_bench=False):
     if os.path.exists(bot.STATE_PATH):
         os.remove(bot.STATE_PATH)
     st = bot.load_state()
@@ -70,19 +70,25 @@ def run(growth, score_sym, label):
                          (8, [0.0] * len(PAIRS))):
         Clock.now = BASE + step * H
         sc.next_scores = scores
+        if break_bench and step == 8:
+            # simulate a position that opened before the benchmark history existed (e.g. pre-restart)
+            st["bench_hist"].pop(str(BASE + 4 * H), None)
         bot.cycle(st, sc, now=Clock.now, fetch=fetch, summarize=summarize)
 
     a = st["accounts"]["market"]
-    n = a["trades"]
+    n, m = a["trades"], a.get("excess_n", 0)
     ex = a.get("excess", 0.0)
-    print(f"\n{label}\n  trades {n} | excess total {ex:+.4%} | "
-          f"per trade {ex / n if n else float('nan'):+.4%}")
+    print(f"\n{label}\n  trades {n} | measured {m} | excess total {ex:+.4%} | "
+          f"per measured trade {ex / m if m else float('nan'):+.4%}")
     return a, st
 
 
 a1, st1 = run({p: 1.01 for p in PAIRS}, "ETH", "A. all 12 coins +1%/h (no dispersion)")
 a2, st2 = run({**{p: 1.0 for p in PAIRS}, "ETH": 1.01}, "ETH",
               "B. only ETH +1%/h, the other 11 flat")
+a3, st3 = run({**{p: 1.0 for p in PAIRS}, "ETH": 1.01}, "ETH",
+              "C. same as B but the entry-hour benchmark is missing (pre-restart position)",
+              break_bench=True)
 
 print("\n--- report() ---")
 bot.report()
@@ -101,5 +107,9 @@ if not (e2 > 0.03):
     ok = False
 if a1["trades"] == 0 or a2["trades"] == 0:
     print("\nFAIL: no trades were taken, the harness is not exercising anything")
+    ok = False
+if a3["trades"] == 0 or a3.get("excess_n", 0) != 0:
+    print(f"\nFAIL C: a trade with no benchmark must be excluded from excess "
+          f"(trades {a3['trades']}, measured {a3.get('excess_n', 0)})")
     ok = False
 print("\nPASS" if ok else "\nFAILED")

@@ -105,7 +105,7 @@ def acct_exposure(a, prices):
     return sum(vals), sum(abs(v) for v in vals)
 
 
-def close_pos(st, name, sym, px, why, now_iso, bench_ret=0.0):
+def close_pos(st, name, sym, px, why, now_iso, bench_ret=None):
     a = st["accounts"][name]
     p = a["pos"].pop(sym)
     fill = px * (1 - p["dir"] * SLIPPAGE)
@@ -118,14 +118,18 @@ def close_pos(st, name, sym, px, why, now_iso, bench_ret=0.0):
     # excess = the trade after removing the equal-weight move of the same universe over the same window.
     # This is the only number that says anything about the model: `ret` is mostly market direction,
     # because the book is not dollar-neutral and can be 40% net long or 10% net short.
-    excess = ret - p["dir"] * bench_ret
-    a["excess"] = a.get("excess", 0.0) + excess
-    a["excess_sq"] = a.get("excess_sq", 0.0) + excess * excess
+    # None when the benchmark for that window is unknown (e.g. the position opened before a restart):
+    # recording `ret` instead would silently overstate the excess.
+    excess = None if bench_ret is None else ret - p["dir"] * bench_ret
+    if excess is not None:
+        a["excess"] = a.get("excess", 0.0) + excess
+        a["excess_sq"] = a.get("excess_sq", 0.0) + excess * excess
+        a["excess_n"] = a.get("excess_n", 0) + 1
     a["wins"] += ret > 0
     append_csv(TRADES_CSV, ["closed", "account", "symbol", "side", "entry", "exit", "return_after_fees",
                             "excess_after_fees", "reason", "score"],
                [now_iso, name, sym, "LONG" if p["dir"] == 1 else "SHORT", p["entry"], round(fill, 10),
-                round(ret, 5), round(excess, 5), why, round(p["score"], 4)])
+                round(ret, 5), "" if excess is None else round(excess, 5), why, round(p["score"], 4)])
     return ret, excess
 
 
@@ -193,10 +197,11 @@ def cycle(st, scorer, now=None, fetch=None, summarize=None):
                 row = df[df.t_ms // 1000 + H == p["exit_at"]]
                 px = float(row.close.iloc[0]) if len(row) else prices[s]
                 base, lvl = hist.get(str(p["exit_at"] - HOLD_H * H)), hist.get(str(close_hour))
-                bench_ret = (lvl / base - 1.0) if (base and lvl) else 0.0
+                bench_ret = (lvl / base - 1.0) if (base and lvl) else None
                 r, ex = close_pos(st, name, s, px, f"{HOLD_H}h exit", now_iso, bench_ret)
+                ex_txt = f"excess {ex:+.2%} vs basket" if ex is not None else "no benchmark for this window"
                 log(f"[{name}] {s}: closed {'LONG' if p['dir'] == 1 else 'SHORT'} after {HOLD_H}h: "
-                    f"{r:+.2%} after fees (excess {ex:+.2%} vs basket)")
+                    f"{r:+.2%} after fees ({ex_txt})")
 
     # 3) new signals
     if decide:
@@ -259,22 +264,23 @@ def report():
         wr = a["wins"] / n if n else float("nan")
         print(f"{name:6s}: cash {a['cash']:.2f} ({a['cash'] / START_CASH - 1:+.2%} closed P&L) | trades {n} | "
               f"win rate {wr:.0%} | fees {a['fees']:.2f}")
-        if not n:
-            print("       excess vs equal-weight basket: no closed trades yet")
+        ne = a.get("excess_n", 0)
+        if not ne:
+            print("       excess vs equal-weight basket: no trade has closed with a benchmark yet")
             continue
         ex, ex2 = a.get("excess", 0.0), a.get("excess_sq", 0.0)
-        mean_ex = ex / n
-        var = max(ex2 / n - mean_ex ** 2, 0.0)
-        se = (var / n) ** 0.5
+        mean_ex = ex / ne
+        var = max(ex2 / ne - mean_ex ** 2, 0.0)
+        se = (var / ne) ** 0.5
         t = mean_ex / se if se > 1e-12 else float("nan")
         t_txt = f"{t:+.2f}" if np.isfinite(t) else "n/a"
         print(f"       excess vs equal-weight basket: total {ex:+.2%} | per trade {mean_ex:+.3%} | "
-              f"t {t_txt} (n={n})")
-        if n >= 600:
+              f"t {t_txt} (n={ne})")
+        if ne >= 600:
             verdict = "has skill" if mean_ex > 0 and t > 2 else "NO cross-sectional skill - kill it"
             print(f"       verdict at n>={600}: {verdict}")
         else:
-            print(f"       {600 - n} more closed trades before this means anything")
+            print(f"       {600 - ne} more measured trades before this means anything")
     print(f"signals {st['signals']} | limit entries missed {st['missed']}")
     print()
     print("excess = the trade's return after removing the equal-weight move of the same coins over the")
